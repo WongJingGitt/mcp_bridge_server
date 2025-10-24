@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "jenkins_tools": {
+      "timeout": 60,
+      "type": "stdio",
+      "command": "D:\\MCP\\JenkinsReport\\.venv\\Scripts\\python.exe",
+      "args": [
+        "D:\\MCP\\JenkinsReport\\main.py"
+      ],
+      "disabled": false
+    }
+  }
+}
