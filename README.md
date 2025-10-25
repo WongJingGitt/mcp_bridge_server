@@ -1,324 +1,183 @@
-# MCP 桥接服务
+# MCP Bridge Server
 
-## 概述
+**为 DeepSeek 网页端提供 MCP 工具能力的本地桥接服务**
 
-MCP 桥接服务器是一个基于 Express.js 的轻量级 HTTP 服务，用于实现与 Model Context Protocol (MCP) 的本地桥接通信。它提供统一的 RESTful API 接口，使开发者能够安全地调用和管理 MCP 服务工具。
+本项目是一个轻量级的本地服务器，旨在作为浏览器插件的后端核心，为原生的 DeepSeek 网页端注入强大的模型上下文协议 (Model Context Protocol, MCP) 工具调用能力。
 
-**核心特性：**
-- ✅ 支持 MCP 协议的标准化通信
-- ✅ 内置进程管理与自动重连机制
-- ✅ 完善的工具调用监控与限流
-- ✅ 跨平台支持（Windows/macOS/Linux）
+它通过一个标准的 HTTP API 与浏览器插件通信，负责在后台动态地启动、管理和调用一个或多个 MCP 服务进程，并将它们的能力统一暴露出去。
 
-**基础信息：**
-- **服务端口：** `3849`
-- **协议：** HTTP
-- **数据格式：** JSON
-- **CORS：** 已启用
+## ✨ 核心特性
 
-## 快速开始
+*   **统一管理**：通过简单的 JSON 配置，即可同时管理和运行多个不同的 MCP 服务。
+*   **分层式工具发现**：创新的两阶段工具发现机制。模型首先获取服务（工具集）的概览，再按需查询具体工具详情，极大地节省了宝贵的上下文（Token）空间。
+*   **动态配置与热重载**：无需重启服务，即可通过 API 更新配置文件并重新加载所有后端 MCP 服务。
+*   **跨平台兼容**：自动检测 Windows, macOS, Linux 等主流操作系统，并将配置文件存储在标准的用户数据目录下。
+*   **简单容错**：内置简单的工具调用重试和熔断机制，当某个工具连续调用失败时会暂时阻止调用，提高稳定性。
+*   **零依赖运行**：可被打包为单一的可执行文件，用户下载后无需安装任何依赖（如 Node.js）即可直接运行。
 
-### 启动服务
+## ⚙️ 工作流程
+
+整个系统的工作流程非常清晰：
+
 ```
-# 开发环境
-npm start
-
-# 打包后（可执行文件）
-./dist/mcp-bridge  # Windows: mcp-bridge.exe
+[浏览器插件 (DeepSeek 增强)] <--- HTTP API ---> [MCP Bridge Server (本项目)] <--- Stdio ---> [具体的 MCP 服务进程 1, 2, 3...]
 ```
 
-> **注意**：
-> - 配置文件自动存储在系统用户目录中，与运行位置无关
-> - Windows: `%APPDATA%\\mcp-bridge\\config\\mcp-config.json`
-> - macOS: `~/Library/Application Support/mcp-bridge/config/mcp-config.json`
-> - Linux: `~/.config/mcp-bridge/config/mcp-config.json`
-> - 配置文件不存在时会自动创建默认空配置
+1.  **插件**负责拦截和改写 DeepSeek 网页端的网络请求，并与用户界面交互。
+2.  **MCP Bridge Server** 负责管理所有后端工具的生命周期，并提供统一的 API 接口。
+3.  **MCP 服务进程** 是实现了 MCP 协议、提供具体工具能力的独立程序。
 
-### 目录结构要求
-```
-# 系统配置目录结构（自动生成）
-# Windows
-C:\\Users\\<用户名>\\AppData\\Roaming\\mcp-bridge\\config\\
-└── mcp-config.json
+## 🚀 快速上手 (用户指南)
 
-# macOS
-~/Library/Application Support/mcp-bridge/config/
-└── mcp-config.json
+后续本项目会打包成可执行文件，您只需要按照以下步骤操作即可。
 
-# Linux
-~/.config/mcp-bridge/config/
-└── mcp-config.json
-```
+### 1. 下载
 
-## API 接口
+从本项目的 GitHub Releases 页面下载对应您操作系统的最新版本（例如 `mcp-bridge-server-win-x64.exe` 或 `mcp-bridge-server-macos-arm64`）。
 
-### 1. 健康检查
-验证服务运行状态。
+### 2. 首次运行
 
-**请求：**
-```http
-GET /health
-```
+直接双击运行该可执行文件。此时会弹出一个命令行窗口，并显示服务正在启动。
 
-**成功响应：**
-```json
-{
-  "status": "ok",
-  "timestamp": 1729820123456
-}
-```
+**最重要的一步**：首次成功运行后，程序会自动在您的系统用户目录下创建一个默认的配置文件 `mcp-config.json`。
 
-### 2. 获取工具列表
-获取所有已注册 MCP 工具的元数据信息。
+### 3. 配置服务
 
-**请求：**
-```http
-GET /tools
-```
+这是使用本项目的**核心步骤**。您需要告诉桥接服务去哪里找到并启动您自己的 MCP 工具。
 
-**响应结构：**
-```json
-{
-  "success": true,
-  "tools": [
+1.  **找到配置文件**：
+    *   **Windows**: `%APPDATA%\mcp-bridge\config\mcp-config.json`
+        (可以直接在资源管理器的地址栏输入 `%APPDATA%` 并回车)
+    *   **macOS**: `~/Library/Application Support/mcp-bridge/config/mcp-config.json`
+    *   **Linux**: `~/.config/mcp-bridge/config/mcp-config.json`
+
+2.  **编辑配置文件**：
+    用任何文本编辑器（如 VS Code, Sublime Text, 记事本）打开 `mcp-config.json`。您会看到如下结构：
+
+    ```json
     {
-      "name": "tool_name",
-      "description": "工具功能描述",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "param1": {"type": "string", "description": "参数说明"},
-          "param2": {"type": "number"}
-        },
-        "required": ["param1"]
-      },
-      "serverName": "服务名称"
-    }
-  ]
-}
-```
-
-### 3. 执行工具
-调用指定 MCP 工具并获取执行结果。
-
-**请求：**
-```http
-POST /execute
-Content-Type: application/json
-```
-
-**请求体：**
-```json
-{
-  "name": "tool_name",
-  "arguments": {
-    "param1": "value1",
-    "param2": 123
-  }
-}
-```
-
-**响应：**
-```json
-{
-  "success": true,
-  "result": "工具执行结果数据"
-}
-```
-
-**错误响应：**
-```json
-{
-  "success": false,
-  "error": "详细的错误原因",
-  "errorCode": "TOOL_NOT_FOUND"
-}
-```
-
-> **安全机制**：单个工具连续失败 3 次后将被临时禁用，可通过 `/reset-history` 重置
-
-### 4. 重载配置
-动态重新加载 MCP 服务器配置。
-
-**请求：**
-```http
-POST /reload
-Content-Type: application/json
-```
-
-**可选参数：**
-```json
-{
-  "configPath": "/自定义/配置路径.json"
-}
-```
-
-**成功响应：**
-```json
-{
-  "success": true,
-  "message": "配置已重载",
-  "toolCount": 5
-}
-```
-
-### 5. 更新配置文件
-持久化保存新配置并立即生效。
-
-**请求：**
-```http
-POST /config
-Content-Type: application/json
-```
-
-**请求体：**
-```json
-{
-  "config": {
-    "mcpServers": {
-      "jenkins_tools": {
-        "command": "node",
-        "args": ["server.js"],
-        "env": {
-          "TOKEN": "secure_value"
+      "mcpServers": {
+        "example_service": {
+          "command": "path/to/your/mcp/server/executable",
+          "args": ["--port", "8080"],
+          "description": "这是一个示例服务，请替换成你自己的配置。它能...",
+          "env": {}
         }
       }
     }
-  },
-  "configPath": "./data/mcp-config.json"
-}
-```
+    ```
 
-### 6. 重置调用历史
-清除工具调用失败计数器。
+    请根据您的实际情况修改它。例如，如果您有一个用 Python 编写的天气服务，您的配置可能如下：
 
-**请求：**
-```http
-POST /reset-history
-```
-
-**响应：**
-```json
-{
-  "success": true,
-  "message": "调用历史已重置",
-  "resetCount": 3
-}
-```
-
-## 配置规范
-
-### 配置文件位置
-- 默认路径：`./data/mcp-config.json`
-- 必须包含 `mcpServers` 配置节点
-- 目录结构需提前创建（服务不会自动创建目录）
-
-### 配置示例
-```json
-{
-  "mcpServers": {
-    "jenkins_tools": {
-      "command": "node",
-      "args": ["jenkins-mcp-server.js"],
-      "env": {
-        "JENKINS_URL": "http://jenkins.example.com",
-        "JENKINS_TOKEN": "your_secure_token"
+    ```json
+    {
+      "mcpServers": {
+        "weather_service": {
+          "command": "python",
+          "args": ["/path/to/your/weather_server.py"],
+          "description": "一个提供实时天气信息和未来天气预报的服务。"
+        },
+        "calculator_service": {
+          "command": "/path/to/your/calculator_app.exe",
+          "args": [],
+          "description": "一个能够执行复杂数学计算和表达式求值的服务。"
+        }
       }
     }
-  }
-}
-```
+    ```
 
-## 安全机制
+    **字段说明**:
+    *   `"weather_service"`: 服务的唯一名称，您可自定义，插件将通过此名称识别服务。
+    *   `"command"`: **[必需]** 用于启动 MCP 服务的命令。可以是 `python`, `node` 等解释器，也可以是可执行文件的完整路径。
+    *   `"args"`: **[可选]** 传递给命令的参数列表，每个参数都是一个独立的字符串。
+    *   `"description"`: **[必需]** 对这个服务的**高级描述**。这段描述会首先被模型看到，用于它判断是否需要使用此服务下的工具。请务必写得清晰准确！
+    *   `"env"`: **[可选]** 为该服务进程设置额外的环境变量。
 
-| 机制                | 说明                              |
-|---------------------|-----------------------------------|
-| 调用频率限制        | 单工具连续失败 3 次后临时禁用     |
-| 进程隔离            | 每个 MCP 服务独立进程运行         |
-| 配置热更新          | 支持运行时动态重载配置            |
-| 环境变量保护        | 敏感信息建议通过安全方式注入      |
+### 4. 重新运行
 
-## 开发者示例
+配置完成后，保存文件。然后再次双击运行 `mcp-bridge-server.exe`。如果配置无误，您将在命令行窗口看到类似 "✓ 服务器 xxx 初始化成功" 的日志。
 
-### Python 调用示例
-``python
-import requests  # 需先安装: pip install requests
+现在，您的桥接服务已经准备就绪，可以与浏览器插件进行交互了！
 
-response = requests.post(
-    'http://localhost:3849/execute',
-    json={
-        'name': 'get_job_status',
-        'arguments': {'job_id': 'build-123'}
+## 📚 API 接口文档
+
+服务启动后，会监听本地的 `3849` 端口。
+
+#### `GET /health`
+*   **功能**: 健康检查。
+*   **返回**: `{ "status": "ok", "timestamp": 1678886400000 }`
+
+#### `GET /tools`
+*   **功能**: **(第一层发现)** 获取所有已加载**服务**的列表及其描述。
+*   **返回**:
+    ```json
+    {
+      "success": true,
+      "services": [
+        { "name": "weather_service", "description": "..." },
+        { "name": "calculator_service", "description": "..." }
+      ]
     }
-)
-print(response.json())  # 输出: {"success": true, "result": "..."}
-```
+    ```
 
-### JavaScript 调用示例
-```
-// 使用 fetch API (现代浏览器)
-const response = await fetch('/execute', {
-  method: 'POST',
-  headers: {'Content-Type': 'application/json'},
-  body: JSON.stringify({
-    name: 'get_job_status',
-    arguments: {job_id: 'build-123'}
-  })
-});
+#### `GET /tools?serverName=<name>`
+*   **功能**: **(第二层发现)** 根据服务名称，获取该服务下的所有具体**工具**的详细信息。
+*   **参数**: `serverName` - 您在配置文件中定义的服务名称。
+*   **返回**:
+    ```json
+    {
+      "success": true,
+      "tools": [
+        {
+          "name": "get_current_weather",
+          "description": "获取指定城市的当前天气",
+          "parameters": { /* JSON Schema */ },
+          "serverName": "weather_service"
+        }
+      ]
+    }
+    ```
 
-const result = await response.json();
-console.log(result); // { success: true, result: "..." }
-```
+#### `POST /execute`
+*   **功能**: 执行一个指定的工具。
+*   **请求体**: `{ "name": "tool_name", "arguments": { "param": "value" } }`
+*   **成功返回**: `{ "success": true, "result": [...] }`
+*   **错误返回**: 
+    ```json
+    {
+      "detail": {
+        "error": "错误消息",
+        "type": "ErrorType",
+        "traceback": "完整的 Python 调用堆栈"
+      }
+    }
+    ```
+    > **错误处理增强**: 从 v1.1 开始,执行失败时会返回详细的错误信息,包括错误类型和完整的 Python 调用堆栈,帮助快速定位问题。浏览器扩展会将这些信息展示给 AI 模型,以便模型分析错误原因并尝试修正。
 
-### Node.js 调用示例
-```
-const axios = require('axios'); // 需先安装: npm install axios
+#### `POST /reload`
+*   **功能**: 重新加载并初始化配置文件中的所有服务。当您修改了 `mcp-config.json` 后，调用此接口可使配置生效，无需重启主服务。
+*   **返回**: `{ "success": true, "message": "配置已重载" }`
 
-async function callTool() {
-  try {
-    const response = await axios.post('http://localhost:3849/execute', {
-      name: 'get_job_status',
-      arguments: { job_id: 'build-123' }
-    });
-    console.log(response.data);
-  } catch (error) {
-    console.error('调用失败:', error.response?.data || error.message);
-  }
-}
-```
+#### `POST /config`
+*   **功能**: 直接通过 API 更新 `mcp-config.json` 文件的内容，并自动执行重载。
+*   **请求体**: `{ "config": { "mcpServers": { ... } } }`
+*   **返回**: `{ "success": true, "message": "配置已保存并重载" }`
 
-## 服务日志
-
-启动成功时显示：
-```
-🚀 MCP 桥接服务已启动
-   地址: http://localhost:3849
-   工具数量: 5
-
-可用接口:
-   GET  /health         - 健康检查
-   GET  /tools          - 获取工具列表
-   POST /execute        - 执行工具
-   POST /reload         - 重载配置
-   POST /config         - 更新配置文件
-   POST /reset-history  - 重置调用历史
-```
-
-## 最佳实践
-
-1. **配置管理**
-   - 将 `data/` 目录加入版本控制忽略列表（.gitignore）
-   - 敏感信息通过环境变量注入，避免硬编码
-
-2. **部署建议**
-   - 生产环境建议通过 `npm run build` 生成可执行文件
-   - 使用进程管理工具（如 pm2）保障服务稳定性
-
-3. **错误处理**
-   - 客户端应实现指数退避重试机制
-   - 关注 `errorCode` 字段进行针对性错误处理
+#### `POST /reset-history`
+*   **功能**: 重置所有工具的失败调用计数器。
+*   **返回**: `{ "success": true, "message": "调用历史已重置" }`
 
 ---
 
-**版本：** 1.0.0  
-**最后更新：** 2025-10-24
+## 🔧 开发者指南 (从源码运行)
+
+如果您想修改源码或从源码运行：
+
+1.  **环境**: 确保您已安装 [Node.js](https://nodejs.org/) (建议 v18 或更高版本)。
+2.  **克隆仓库**: `git clone <repository_url>`
+3.  **安装依赖**: `cd mcp-bridge-server && npm install`
+4.  **运行**: `node mcp-bridge-server.js`
+
+## 📄 许可证
+
+本项目采用 [MIT](https://opensource.org/licenses/MIT) 许可证。
