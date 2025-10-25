@@ -9,10 +9,26 @@ import json
 import os
 import signal
 import sys
+import socket
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 from contextlib import asynccontextmanager
+
+# 尝试导入版本信息
+try:
+    # 如果是打包后的程序，使用相对导入
+    if getattr(sys, 'frozen', False):
+        __version__ = "1.0.0"
+    else:
+        # 开发环境，从 version.py 导入
+        parent_dir = Path(__file__).parent.parent
+        if str(parent_dir) not in sys.path:
+            sys.path.insert(0, str(parent_dir))
+        from version import __version__
+except ImportError:
+    __version__ = "1.0.0"
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +42,178 @@ from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
 
 PORT = 3849
+
+
+def is_port_in_use(port: int) -> bool:
+    """检查端口是否被占用"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(('0.0.0.0', port))
+            return False
+        except OSError:
+            return True
+
+
+def get_process_using_port(port: int) -> Optional[Dict[str, Any]]:
+    """获取占用端口的进程信息"""
+    try:
+        if sys.platform == "win32":
+            # Windows 使用 netstat
+            result = subprocess.run(
+                ['netstat', '-ano'],
+                capture_output=True,
+                text=True,
+                encoding='gbk',
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+            )
+            for line in result.stdout.split('\n'):
+                if f':{port} ' in line or f':{port}\t' in line:
+                    parts = line.split()
+                    if len(parts) >= 5 and parts[1].endswith(f':{port}'):
+                        pid = parts[-1]
+                        # 获取进程名称
+                        try:
+                            tasklist_result = subprocess.run(
+                                ['tasklist', '/FI', f'PID eq {pid}', '/NH'],
+                                capture_output=True,
+                                text=True,
+                                encoding='gbk',
+                                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+                            )
+                            process_name = tasklist_result.stdout.split()[0] if tasklist_result.stdout else "Unknown"
+                            return {"pid": pid, "name": process_name}
+                        except:
+                            return {"pid": pid, "name": "Unknown"}
+        else:
+            # Linux/Mac 使用 lsof
+            result = subprocess.run(
+                ['lsof', '-i', f':{port}', '-t'],
+                capture_output=True,
+                text=True
+            )
+            if result.stdout.strip():
+                pid = result.stdout.strip().split('\n')[0]
+                # 获取进程名称
+                try:
+                    name_result = subprocess.run(
+                        ['ps', '-p', pid, '-o', 'comm='],
+                        capture_output=True,
+                        text=True
+                    )
+                    process_name = name_result.stdout.strip()
+                    return {"pid": pid, "name": process_name}
+                except:
+                    return {"pid": pid, "name": "Unknown"}
+    except Exception as e:
+        print(f"获取进程信息失败: {e}")
+    
+    return None
+
+
+def kill_process_by_pid(pid: str) -> bool:
+    """根据 PID 结束进程"""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ['taskkill', '/F', '/PID', pid], 
+                check=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+            )
+        else:
+            subprocess.run(['kill', '-9', pid], check=True)
+        return True
+    except Exception as e:
+        print(f"结束进程失败: {e}")
+        return False
+
+
+def check_and_handle_port(port: int, auto_kill: bool = False) -> bool:
+    """
+    检查并处理端口占用
+    
+    Args:
+        port: 要检查的端口
+        auto_kill: 是否自动结束占用进程（通过环境变量或命令行参数）
+    
+    Returns:
+        True 如果端口可用，False 如果端口被占用且用户选择不结束进程
+    """
+    if not is_port_in_use(port):
+        return True
+    
+    print(f"\n⚠️  端口 {port} 已被占用")
+    
+    # 获取占用进程信息
+    process_info = get_process_using_port(port)
+    if process_info:
+        print(f"   占用进程: {process_info['name']} (PID: {process_info['pid']})")
+    
+    # 检查环境变量
+    if auto_kill or os.environ.get('MCP_AUTO_KILL_PORT', '').lower() in ['true', '1', 'yes']:
+        print(f"   自动结束占用进程...")
+        if process_info and kill_process_by_pid(process_info['pid']):
+            print(f"   ✓ 进程已结束")
+            # 等待端口释放
+            import time
+            time.sleep(1)
+            if not is_port_in_use(port):
+                print(f"   ✓ 端口 {port} 已释放")
+                return True
+            else:
+                print(f"   ✗ 端口 {port} 仍被占用")
+                return False
+        else:
+            print(f"   ✗ 无法结束进程")
+            return False
+    
+    # 交互式询问
+    try:
+        print(f"\n请选择操作:")
+        print(f"  1. 结束占用进程并继续")
+        print(f"  2. 使用其他端口")
+        print(f"  3. 退出程序")
+        
+        choice = input("\n请输入选项 (1/2/3): ").strip()
+        
+        if choice == '1':
+            if process_info and kill_process_by_pid(process_info['pid']):
+                print(f"✓ 进程已结束")
+                # 等待端口释放
+                import time
+                time.sleep(1)
+                if not is_port_in_use(port):
+                    print(f"✓ 端口 {port} 已释放")
+                    return True
+                else:
+                    print(f"✗ 端口 {port} 仍被占用，请手动处理")
+                    return False
+            else:
+                print(f"✗ 无法结束进程")
+                return False
+        
+        elif choice == '2':
+            new_port = input(f"请输入新端口号 (当前: {port}): ").strip()
+            try:
+                new_port_num = int(new_port)
+                if 1 <= new_port_num <= 65535:
+                    global PORT
+                    PORT = new_port_num
+                    print(f"✓ 已切换到端口 {PORT}")
+                    return check_and_handle_port(PORT, auto_kill)
+                else:
+                    print(f"✗ 端口号必须在 1-65535 之间")
+                    return False
+            except ValueError:
+                print(f"✗ 无效的端口号")
+                return False
+        
+        else:
+            print("退出程序")
+            return False
+    
+    except (KeyboardInterrupt, EOFError):
+        print("\n\n已取消")
+        return False
 
 
 def get_config_path() -> Path:
@@ -86,6 +274,12 @@ class ConfigUpdateRequest(BaseModel):
     config: Dict[str, Any]
 
 
+class ServerRestartRequest(BaseModel):
+    """服务器重启请求"""
+    serverName: str
+    config: Optional[Dict[str, Any]] = None  # 可选的新配置
+
+
 class MCPManager:
     """MCP服务管理器"""
     
@@ -93,6 +287,7 @@ class MCPManager:
         self.clients: Dict[str, Dict[str, Any]] = {}
         self.tool_call_history: Dict[str, int] = {}
         self.sessions: Dict[str, ClientSession] = {}
+        self.config_cache: Dict[str, Any] = {}  # 缓存配置用于重启单个服务
     
     async def load_config(self, config_path: Path) -> Dict[str, Any]:
         """加载配置文件"""
@@ -117,10 +312,13 @@ class MCPManager:
                     json.dump(default_config, f, indent=2, ensure_ascii=False)
                 
                 print(f"✓ 默认配置已创建: {config_path}")
+                self.config_cache = default_config  # 缓存配置
                 return default_config
             
             with open(config_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                config = json.load(f)
+                self.config_cache = config  # 缓存配置
+                return config
         
         except Exception as e:
             print(f"读取配置失败: {e}")
@@ -424,29 +622,78 @@ class MCPManager:
     
     async def shutdown(self):
         """关闭所有服务器连接"""
-        for name, client_data in self.clients.items():
-            try:
-                # 先关闭会话上下文
-                session_context = client_data.get("session_context")
-                if session_context:
-                    await session_context.__aexit__(None, None, None)
-                
-                # 根据类型关闭对应的传输层连接
-                server_type = client_data.get("type", "stdio")
-                if server_type == "sse":
-                    sse_context = client_data.get("sse_context")
-                    if sse_context:
-                        await sse_context.__aexit__(None, None, None)
-                else:
-                    stdio_context = client_data.get("stdio_context")
-                    if stdio_context:
-                        await stdio_context.__aexit__(None, None, None)
-                
-                print(f"已关闭服务器: {name}")
-            except Exception as e:
-                print(f"关闭服务器 {name} 失败: {e}")
+        for name in list(self.clients.keys()):
+            await self.shutdown_server(name)
+    
+    async def shutdown_server(self, server_name: str):
+        """关闭指定的服务器连接"""
+        if server_name not in self.clients:
+            print(f"服务器 {server_name} 不存在，无需关闭")
+            return
         
-        self.clients.clear()
+        client_data = self.clients[server_name]
+        
+        try:
+            # 创建一个新任务来处理关闭，避免 cancel scope 错误
+            async def cleanup():
+                try:
+                    # 先关闭会话上下文
+                    session_context = client_data.get("session_context")
+                    if session_context:
+                        try:
+                            await session_context.__aexit__(None, None, None)
+                        except Exception as e:
+                            print(f"  关闭会话上下文时出错: {e}")
+                    
+                    # 根据类型关闭对应的传输层连接
+                    server_type = client_data.get("type", "stdio")
+                    if server_type == "sse":
+                        sse_context = client_data.get("sse_context")
+                        if sse_context:
+                            try:
+                                await sse_context.__aexit__(None, None, None)
+                            except Exception as e:
+                                print(f"  关闭 SSE 连接时出错: {e}")
+                    else:
+                        stdio_context = client_data.get("stdio_context")
+                        if stdio_context:
+                            try:
+                                await stdio_context.__aexit__(None, None, None)
+                            except Exception as e:
+                                print(f"  关闭 stdio 连接时出错: {e}")
+                except Exception as e:
+                    print(f"  清理资源时出错: {e}")
+            
+            # 使用 asyncio.create_task 在新任务中执行清理
+            # 但我们不等待它完成，让它在后台运行
+            asyncio.create_task(cleanup())
+            
+            # 给一点时间让清理开始
+            await asyncio.sleep(0.1)
+            
+            print(f"已关闭服务器: {server_name}")
+        except Exception as e:
+            print(f"关闭服务器 {server_name} 失败: {e}")
+        finally:
+            # 无论如何都从字典中移除
+            self.clients.pop(server_name, None)
+    
+    async def restart_server(self, server_name: str, server_config: Optional[Dict[str, Any]] = None):
+        """重启指定的服务器"""
+        # 如果没有提供配置，使用缓存的配置
+        if server_config is None:
+            if server_name not in self.config_cache.get("mcpServers", {}):
+                raise ValueError(f"服务器 {server_name} 的配置不存在")
+            server_config = self.config_cache["mcpServers"][server_name]
+        
+        # 先关闭
+        await self.shutdown_server(server_name)
+        
+        # 等待一下确保资源释放
+        await asyncio.sleep(0.5)
+        
+        # 重新初始化
+        await self.init_server(server_name, server_config)
 
 
 # 全局管理器实例
@@ -492,7 +739,9 @@ async def lifespan(app: FastAPI):
         print(f"   POST /execute                 - 执行工具")
         print(f"   GET  /config                  - 读取配置文件内容")
         print(f"   POST /config                  - 更新配置文件并重载")
-        print(f"   POST /reload                  - 手动重载配置")
+        print(f"   POST /reload                  - 手动重载所有服务")
+        print(f"   POST /restart-server          - 重启指定服务")
+        print(f"   POST /shutdown-server         - 关闭指定服务")
         print(f"   POST /reset-history           - 重置调用历史\n")
     
     except Exception as e:
@@ -624,6 +873,57 @@ async def reset_history():
     return {"success": True, "message": "调用历史已重置"}
 
 
+@app.post("/restart-server")
+async def restart_server(request: ServerRestartRequest):
+    """重启指定的服务器"""
+    try:
+        server_name = request.serverName
+        
+        # 检查服务是否存在
+        if server_name not in manager.clients and server_name not in manager.config_cache.get("mcpServers", {}):
+            raise HTTPException(status_code=404, detail=f"服务 {server_name} 不存在")
+        
+        # 重启服务
+        await manager.restart_server(server_name, request.config)
+        
+        return {
+            "success": True,
+            "message": f"服务 {server_name} 已重启",
+            "toolCount": len(manager.clients[server_name]["tools"]) if server_name in manager.clients else 0
+        }
+    
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/shutdown-server")
+async def shutdown_server(request: ServerRestartRequest):
+    """关闭指定的服务器"""
+    try:
+        server_name = request.serverName
+        
+        # 检查服务是否存在
+        if server_name not in manager.clients:
+            raise HTTPException(status_code=404, detail=f"服务 {server_name} 不存在或未运行")
+        
+        # 关闭服务
+        await manager.shutdown_server(server_name)
+        
+        return {
+            "success": True,
+            "message": f"服务 {server_name} 已关闭"
+        }
+    
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 def signal_handler(sig, frame):
     """处理终止信号"""
     print("\n接收到终止信号，正在关闭...")
@@ -631,14 +931,69 @@ def signal_handler(sig, frame):
 
 
 if __name__ == "__main__":
+    import argparse
+    
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(
+        description=f'MCP Bridge Server v{__version__}',
+        epilog='详细文档: https://github.com/your-repo/mcp-bridge-server'
+    )
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'MCP Bridge Server v{__version__}'
+    )
+    parser.add_argument(
+        '--port', 
+        type=int, 
+        default=PORT, 
+        help=f'服务器端口 (默认: {PORT})'
+    )
+    parser.add_argument(
+        '--auto-kill-port',
+        action='store_true',
+        help='自动结束占用端口的进程'
+    )
+    parser.add_argument(
+        '--config',
+        type=str,
+        help='配置文件路径'
+    )
+    args = parser.parse_args()
+    
+    # 更新端口
+    PORT = args.port
+    
+    # 设置配置文件路径环境变量
+    if args.config:
+        os.environ['MCP_CONFIG_PATH'] = args.config
+    
+    # 检查端口
+    print(f"MCP Bridge Server v{__version__}")
+    print(f"正在检查端口 {PORT}...")
+    
+    if not check_and_handle_port(PORT, args.auto_kill_port):
+        print("\n无法启动服务器: 端口不可用")
+        sys.exit(1)
+    
+    print(f"✓ 端口 {PORT} 可用\n")
+    
     # 注册信号处理
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
     # 启动服务器
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=PORT,
-        log_level="info"
-    )
+    try:
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=PORT,
+            log_level="info"
+        )
+    except OSError as e:
+        if "address already in use" in str(e).lower():
+            print(f"\n✗ 错误: 端口 {PORT} 已被占用")
+            print(f"   请使用 --port 参数指定其他端口，或使用 --auto-kill-port 自动结束占用进程")
+        else:
+            print(f"\n✗ 启动失败: {e}")
+        sys.exit(1)
