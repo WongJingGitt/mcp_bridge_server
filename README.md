@@ -35,13 +35,84 @@
 
 从本项目的 GitHub Releases 页面下载对应您操作系统的最新版本（例如 `mcp-bridge-server-win-x64.exe` 或 `mcp-bridge-server-macos-arm64`）。
 
-### 2. 首次运行
+### 2. 启动服务
+
+#### 方式 1: 使用启动脚本（推荐）
+
+**Windows 用户**:
+```bash
+# 双击运行或在命令行执行
+start.bat
+```
+
+**Linux/Mac 用户**:
+```bash
+# 赋予执行权限（首次）
+chmod +x start.sh
+
+# 运行
+./start.sh
+```
+
+启动脚本会提供友好的菜单选项：
+- 默认启动（交互式）
+- 自动处理端口占用
+- 自定义端口
+- 查看帮助
+
+#### 方式 2: 直接运行（开发者）
+
+```bash
+# 默认启动（端口 3849，交互式处理端口占用）
+python utils/mcp_bridge.py
+
+# 自动结束占用进程并启动
+python utils/mcp_bridge.py --auto-kill-port
+
+# 使用自定义端口
+python utils/mcp_bridge.py --port 8080
+
+# 组合使用
+python utils/mcp_bridge.py --port 8080 --auto-kill-port --config /path/to/config.json
+```
+
+#### 端口占用处理
+
+首次运行时，程序会自动检查端口是否被占用：
+
+```
+MCP Bridge Server v1.0.0
+正在检查端口 3849...
+
+⚠️  端口 3849 已被占用
+   占用进程: python.exe (PID: 12345)
+
+请选择操作:
+  1. 结束占用进程并继续
+  2. 使用其他端口
+  3. 退出程序
+
+请输入选项 (1/2/3): 
+```
+
+**命令行参数**:
+- `--port PORT`: 指定端口号（默认 3849）
+- `--auto-kill-port`: 自动结束占用端口的进程
+- `--config PATH`: 指定配置文件路径
+
+**环境变量**:
+- `MCP_AUTO_KILL_PORT=true`: 自动处理端口占用
+- `MCP_CONFIG_PATH=/path/to/config`: 配置文件路径
+
+详细说明请参考 [端口管理文档](docs/PORT_MANAGEMENT.md)。
+
+### 3. 首次运行
 
 直接双击运行该可执行文件。此时会弹出一个命令行窗口，并显示服务正在启动。
 
 **最重要的一步**：首次成功运行后，程序会自动在您的系统用户目录下创建一个默认的配置文件 `mcp-config.json`。
 
-### 3. 配置服务
+### 4. 配置服务
 
 这是使用本项目的**核心步骤**。您需要告诉桥接服务去哪里找到并启动您自己的 MCP 工具。
 
@@ -93,15 +164,34 @@
     *   `"description"`: **[必需]** 对这个服务的**高级描述**。这段描述会首先被模型看到，用于它判断是否需要使用此服务下的工具。请务必写得清晰准确！
     *   `"env"`: **[可选]** 为该服务进程设置额外的环境变量。
 
-### 4. 重新运行
+### 5. 重新运行或重载
 
-配置完成后，保存文件。然后再次双击运行 `mcp-bridge-server.exe`。如果配置无误，您将在命令行窗口看到类似 "✓ 服务器 xxx 初始化成功" 的日志。
+配置完成后，保存文件。有两种方式应用新配置：
+
+**方式 1: 重启服务**
+- 关闭当前运行的服务（Ctrl+C）
+- 重新运行启动脚本或命令
+
+**方式 2: 热重载（推荐）**
+```bash
+# 使用 API 重载配置
+curl -X POST http://localhost:3849/reload
+
+# 或重启单个服务
+curl -X POST http://localhost:3849/restart-server \
+  -H "Content-Type: application/json" \
+  -d '{"serverName": "weather_service"}'
+```
+
+如果配置无误，您将在命令行窗口看到类似 "✓ 服务器 xxx 初始化成功" 的日志。
 
 现在，您的桥接服务已经准备就绪，可以与浏览器插件进行交互了！
 
 ## 📚 API 接口文档
 
-服务启动后，会监听本地的 `3849` 端口。
+服务启动后，默认监听本地的 `3849` 端口（可通过 `--port` 参数修改）。
+
+### 核心接口
 
 #### `GET /health`
 *   **功能**: 健康检查。
@@ -163,15 +253,60 @@
 *   **请求体**: `{ "config": { "mcpServers": { ... } } }`
 *   **返回**: `{ "success": true, "message": "配置已保存并重载" }`
 
+### 服务管理接口
+
+#### `POST /restart-server`
+*   **功能**: 重启指定的单个服务，而不影响其他服务。
+*   **请求体**: 
+    ```json
+    {
+      "serverName": "weather_service",
+      "config": { /* 可选，提供新配置 */ }
+    }
+    ```
+*   **返回**: `{ "success": true, "message": "服务 xxx 已重启", "toolCount": 5 }`
+*   **详细文档**: 参见 [服务重启指南](docs/RESTART_SERVER_GUIDE.md)
+
+#### `POST /shutdown-server`
+*   **功能**: 关闭指定的服务。
+*   **请求体**: `{ "serverName": "weather_service" }`
+*   **返回**: `{ "success": true, "message": "服务 xxx 已关闭" }`
+
 #### `POST /reset-history`
 *   **功能**: 重置所有工具的失败调用计数器。
 *   **返回**: `{ "success": true, "message": "调用历史已重置" }`
 
 ---
 
-## 🔧 开发者指南 (从源码运行)
+## � 文档
+
+- [端口管理指南](docs/PORT_MANAGEMENT.md) - 端口检测和处理
+- [服务重启指南](docs/RESTART_SERVER_GUIDE.md) - 单独重启服务功能
+
+## �🔧 开发者指南 (从源码运行)
 
 如果您想修改源码或从源码运行：
+
+### Python 版本
+
+1.  **环境要求**: Python 3.8+
+2.  **克隆仓库**: `git clone <repository_url>`
+3.  **安装依赖**: 
+    ```bash
+    cd mcp-bridge-server
+    pip install -r requirements.txt
+    ```
+4.  **运行**: 
+    ```bash
+    # 默认启动
+    python utils/mcp_bridge.py
+    
+    # 使用启动脚本
+    ./start.sh  # Linux/Mac
+    start.bat   # Windows
+    ```
+
+### Node.js 版本（如有）
 
 1.  **环境**: 确保您已安装 [Node.js](https://nodejs.org/) (建议 v18 或更高版本)。
 2.  **克隆仓库**: `git clone <repository_url>`
