@@ -25,13 +25,13 @@ MCP Bridge Server 是 [MCP Bridge 浏览器扩展](https://github.com/WongJingGi
 
 ```
 ┌─────────────────┐                    ┌──────────────────────┐
-│  浏览器扩展       │ ◄── HTTP/REST ──►  │  MCP Bridge Server   │
-│  (前端界面)       │                    │  (本项目)             │
+│  浏览器扩展      │ ◄── HTTP/REST ──►  │  MCP Bridge Server   │
+│  (前端界面)      │                    │  (本项目)            │
 └─────────────────┘                    └──────────┬───────────┘
                                                   │ MCP Protocol
                                                   │ (stdio)
                                        ┌──────────▼───────────┐
-                                       │  MCP 工具服务进程      │
+                                       │  MCP 工具服务进程     │
                                        │  • filesystem        │
                                        │  • git               │
                                        │  • database          │
