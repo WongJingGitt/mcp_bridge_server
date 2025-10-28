@@ -267,6 +267,7 @@ class ExecuteRequest(BaseModel):
     """执行工具请求"""
     name: str
     arguments: Dict[str, Any] = {}
+    serverName: Optional[str] = None  # 可选的服务名称，用于指定特定服务下的工具
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -576,35 +577,135 @@ class MCPManager:
             for tool in tools
         ]
     
-    async def execute_tool(self, tool_name: str, args: Dict[str, Any]) -> Any:
-        """执行工具"""
-        # 查找工具所属的服务器
-        target_server = None
-        target_session = None
+    def get_tool_detail(self, tool_name: str, server_name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        获取工具的详细信息
         
-        for server_name, client_data in self.clients.items():
-            tools = client_data["tools"]
+        Args:
+            tool_name: 工具名称
+            server_name: 可选的服务名称
+        
+        Returns:
+            工具的详细信息，包括完整的参数定义
+        """
+        target_server = None
+        target_tool = None
+        
+        if server_name:
+            if server_name not in self.clients:
+                raise ValueError(f"服务 {server_name} 不存在或未加载")
+            
+            tools = self.clients[server_name]["tools"]
             for tool in tools:
                 if tool.name == tool_name:
                     target_server = server_name
+                    target_tool = tool
+                    break
+            
+            if not target_tool:
+                raise ValueError(f"服务 {server_name} 中不存在工具 {tool_name}")
+        else:
+            # 在所有服务中查找
+            for srv_name, client_data in self.clients.items():
+                tools = client_data["tools"]
+                for tool in tools:
+                    if tool.name == tool_name:
+                        target_server = srv_name
+                        target_tool = tool
+                        break
+                if target_tool:
+                    break
+            
+            if not target_tool:
+                raise ValueError(f"工具 {tool_name} 不存在")
+        
+        # 提取完整的工具信息
+        return {
+            "name": target_tool.name,
+            "description": target_tool.description,
+            "serverName": target_server,
+            "inputSchema": target_tool.inputSchema if hasattr(target_tool, 'inputSchema') else {},
+            "parameters": target_tool.inputSchema if hasattr(target_tool, 'inputSchema') else {}
+        }
+    
+    async def execute_tool(self, tool_name: str, args: Dict[str, Any], server_name: Optional[str] = None) -> Any:
+        """
+        执行工具
+        
+        Args:
+            tool_name: 工具名称
+            args: 工具参数
+            server_name: 可选的服务名称，指定从哪个服务调用工具
+        
+        Returns:
+            工具执行结果
+        
+        Raises:
+            ValueError: 当工具不存在、服务不存在或达到最大调用次数时
+        """
+        target_server = None
+        target_session = None
+        
+        # 清理参数：移除值为 None 的键，因为某些 MCP 服务可能不支持 null 值
+        cleaned_args = {k: v for k, v in args.items() if v is not None}
+        
+        # 如果指定了服务名称，直接在该服务中查找
+        if server_name:
+            if server_name not in self.clients:
+                raise ValueError(f"服务 {server_name} 不存在或未加载")
+            
+            client_data = self.clients[server_name]
+            tools = client_data["tools"]
+            
+            # 在指定服务中查找工具
+            tool_found = False
+            for tool in tools:
+                if tool.name == tool_name:
+                    tool_found = True
+                    target_server = server_name
                     target_session = client_data["session"]
                     break
-            if target_server:
-                break
+            
+            if not tool_found:
+                raise ValueError(f"服务 {server_name} 中不存在工具 {tool_name}")
         
-        if not target_server:
-            raise ValueError(f"工具 {tool_name} 不存在")
+        else:
+            # 未指定服务名称，在所有服务中查找（保持向后兼容）
+            matching_servers = []
+            
+            for srv_name, client_data in self.clients.items():
+                tools = client_data["tools"]
+                for tool in tools:
+                    if tool.name == tool_name:
+                        matching_servers.append(srv_name)
+                        if not target_server:  # 记录第一个匹配的服务
+                            target_server = srv_name
+                            target_session = client_data["session"]
+                        break
+            
+            if not target_server:
+                raise ValueError(f"工具 {tool_name} 不存在")
+            
+            # 如果有多个服务提供同名工具，给出警告
+            if len(matching_servers) > 1:
+                print(f"⚠️  警告: 工具 {tool_name} 在多个服务中存在: {', '.join(matching_servers)}")
+                print(f"   将使用服务 {target_server}，建议在请求中指定 serverName 参数以避免歧义")
         
         # 检查调用次数
         call_key = f"{target_server}:{tool_name}"
         call_count = self.tool_call_history.get(call_key, 0)
         
         if call_count >= 3:
-            raise ValueError(f"工具 {tool_name} 已达到最大调用次数 (3次)")
+            raise ValueError(f"工具 {tool_name} (服务: {target_server}) 已达到最大调用次数 (3次)")
         
         try:
+            # 打印调试信息
+            print(f"[执行工具] 服务: {target_server}, 工具: {tool_name}")
+            print(f"[原始参数] {args}")
+            print(f"[清理后参数] {cleaned_args}")
+            
             # 调用工具
-            result = await target_session.call_tool(tool_name, args)
+            result = await target_session.call_tool(tool_name, cleaned_args)
             
             # 重置调用计数
             self.tool_call_history[call_key] = 0
@@ -614,6 +715,11 @@ class MCPManager:
         except Exception as e:
             # 增加调用计数
             self.tool_call_history[call_key] = call_count + 1
+            
+            # 打印详细错误信息
+            print(f"[工具执行失败] 服务: {target_server}, 工具: {tool_name}")
+            print(f"[错误类型] {type(e).__name__}")
+            print(f"[错误信息] {str(e)}")
             raise
     
     def reset_tool_call_history(self):
@@ -733,16 +839,17 @@ async def lifespan(app: FastAPI):
         print(f"   地址: http://localhost:{PORT}")
         print(f"   已加载服务数量: {len(manager.get_services())}")
         print(f"\n可用接口:")
-        print(f"   GET  /health                  - 健康检查")
-        print(f"   GET  /tools                   - 获取所有[服务]的列表和描述")
-        print(f"   GET  /tools?serverName=<n> - 获取指定服务下的[工具]列表")
-        print(f"   POST /execute                 - 执行工具")
-        print(f"   GET  /config                  - 读取配置文件内容")
-        print(f"   POST /config                  - 更新配置文件并重载")
-        print(f"   POST /reload                  - 手动重载所有服务")
-        print(f"   POST /restart-server          - 重启指定服务")
-        print(f"   POST /shutdown-server         - 关闭指定服务")
-        print(f"   POST /reset-history           - 重置调用历史\n")
+        print(f"   GET  /health                     - 健康检查")
+        print(f"   GET  /tools                      - 获取所有[服务]的列表和描述")
+        print(f"   GET  /tools?serverName=<name>    - 获取指定服务下的[工具]列表")
+        print(f"   GET  /tool-detail?toolName=<n>   - 获取工具的详细参数定义")
+        print(f"   POST /execute                    - 执行工具（可选 serverName 参数）")
+        print(f"   GET  /config                     - 读取配置文件内容")
+        print(f"   POST /config                     - 更新配置文件并重载")
+        print(f"   POST /reload                     - 手动重载所有服务")
+        print(f"   POST /restart-server             - 重启指定服务")
+        print(f"   POST /shutdown-server            - 关闭指定服务")
+        print(f"   POST /reset-history              - 重置调用历史\n")
     
     except Exception as e:
         print(f"启动失败: {e}")
@@ -797,11 +904,53 @@ async def get_tools(serverName: Optional[str] = Query(None)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/tool-detail")
+async def get_tool_detail(
+    toolName: str = Query(..., description="工具名称"),
+    serverName: Optional[str] = Query(None, description="服务名称（可选）")
+):
+    """
+    获取工具的详细信息
+    
+    参数:
+        - toolName: 工具名称（必需）
+        - serverName: 服务名称（可选，如果有重名工具建议指定）
+    
+    返回工具的完整定义，包括参数 schema，用于调试和了解工具的参数要求
+    """
+    try:
+        detail = manager.get_tool_detail(toolName, serverName)
+        return {"success": True, "tool": detail}
+    
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/execute")
 async def execute_tool(request: ExecuteRequest):
-    """执行工具"""
+    """
+    执行工具
+    
+    请求体:
+        - name: 工具名称（必需）
+        - arguments: 工具参数（可选，默认为空对象）
+        - serverName: 服务名称（可选，指定从哪个服务调用工具）
+    
+    示例:
+        不指定服务（兼容旧版本）:
+        {"name": "read_file", "arguments": {"path": "/tmp/test.txt"}}
+        
+        指定服务（推荐，避免重名工具冲突）:
+        {"name": "read_file", "arguments": {"path": "/tmp/test.txt"}, "serverName": "filesystem"}
+    """
     try:
-        result = await manager.execute_tool(request.name, request.arguments)
+        result = await manager.execute_tool(
+            request.name, 
+            request.arguments,
+            request.serverName  # 传递可选的服务名称
+        )
         
         # 提取内容
         content = []
