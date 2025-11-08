@@ -557,25 +557,32 @@ class MCPManager:
             config = client_data["config"]
             services.append({
                 "name": server_name,
-                "description": config.get("description", f"一个名为 {server_name} 的工具服务。")
+                "description": config.get("description", f"一个名为 {server_name} 的工具服务。"),
+                "is_core": config.get("is_core", False)  # 读取配置中的 is_core 标记，默认为 False
             })
         return services
     
-    def get_tools_by_server(self, server_name: str) -> List[Dict[str, Any]]:
-        """获取指定服务器的工具列表"""
+    def get_tools_by_server(self, server_name: str) -> Dict[str, Any]:
+        """获取指定服务器的工具列表（包含服务描述）"""
         if server_name not in self.clients:
             raise ValueError(f"服务 {server_name} 不存在或未成功加载")
         
-        tools = self.clients[server_name]["tools"]
-        return [
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.inputSchema if hasattr(tool, 'inputSchema') else {},
-                "serverName": server_name
-            }
-            for tool in tools
-        ]
+        client_data = self.clients[server_name]
+        config = client_data["config"]
+        tools = client_data["tools"]
+        
+        return {
+            "service_name": server_name,
+            "service_description": config.get("description", f"一个名为 {server_name} 的工具服务。"),
+            "tools": [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.inputSchema if hasattr(tool, 'inputSchema') else {}
+                }
+                for tool in tools
+            ]
+        }
     
     def get_tool_detail(self, tool_name: str, server_name: Optional[str] = None) -> Dict[str, Any]:
         """
