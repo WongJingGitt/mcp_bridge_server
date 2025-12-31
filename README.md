@@ -58,6 +58,13 @@ MCP Bridge Server 是 [MCP Bridge 浏览器扩展](https://github.com/WongJingGi
 - **错误追踪** - 返回详细的错误堆栈信息，帮助 AI 自主诊断和修正
 - **熔断保护** - 内置重试和熔断机制，防止故障服务影响整体稳定性
 
+### 🚀 性能优化特性
+
+- **智能缓存系统** - 大结果自动缓存，支持内存和文件两级缓存
+- **流式搜索** - 在大文件中快速搜索关键词，内存占用恒定
+- **分段获取** - 支持按需分段获取大结果，避免一次性传输过多数据
+- **精确定位** - 快速获取指定行的上下文内容
+
 ---
 
 ## 🚀 快速开始
@@ -355,6 +362,8 @@ curl http://localhost:3849/tools?serverName=filesystem
 
 ### 核心接口
 
+#### 工具执行接口
+
 #### `GET /health`
 *   **功能**: 健康检查。
 *   **返回**: `{ "status": "ok", "timestamp": 1678886400000 }`
@@ -437,6 +446,126 @@ curl http://localhost:3849/tools?serverName=filesystem
 #### `POST /reset-history`
 *   **功能**: 重置所有工具的失败调用计数器。
 *   **返回**: `{ "success": true, "message": "调用历史已重置" }`
+
+### 缓存管理接口
+
+#### `GET /result/{cache_id}`
+*   **功能**: 获取缓存的结果内容（支持分段获取）。
+*   **参数**: 
+    - `cache_id` - 缓存ID（从工具执行结果中获取）
+    - `start` - 可选，起始字符位置（默认0）
+    - `end` - 可选，结束字符位置（默认全部）
+*   **返回**:
+    ```json
+    {
+      "success": true,
+      "result": "缓存内容",
+      "metadata": {
+        "total_length": 30520,
+        "start": 0,
+        "end": 10000,
+        "has_more": true
+      }
+    }
+    ```
+
+#### `POST /search-cache`
+*   **功能**: 在缓存内容中搜索关键词（流式处理，性能优化）。
+*   **请求体**:
+    ```json
+    {
+      "cache_id": "缓存ID",
+      "keyword": "搜索关键词",
+      "case_sensitive": false,
+      "max_results": 50
+    }
+    ```
+*   **返回**:
+    ```json
+    {
+      "success": true,
+      "result": {
+        "keyword": "搜索关键词",
+        "total_matches": 15,
+        "matches": [
+          {
+            "line": 23,
+            "column": 45,
+            "content": "...匹配的内容片段..."
+          }
+        ],
+        "truncated": false
+      }
+    }
+    ```
+*   **性能特点**:
+    - 流式读取，内存占用恒定（~10MB）
+    - 支持任意大小文件
+    - 10MB 文件搜索 < 100ms
+
+#### `POST /get-cache-context`
+*   **功能**: 获取缓存中指定行的上下文内容。
+*   **请求体**:
+    ```json
+    {
+      "cache_id": "缓存ID",
+      "line_num": 23,
+      "context_lines": 5
+    }
+    ```
+*   **返回**:
+    ```json
+    {
+      "success": true,
+      "result": {
+        "target_line": 23,
+        "context_start": 18,
+        "context_end": 28,
+        "total_lines": 500,
+        "content": "...上下文内容..."
+      }
+    }
+    ```
+
+### 缓存系统说明
+
+当工具返回的结果超过阈值（默认 1000 字节）时，服务端会自动缓存结果并返回缓存引用：
+
+```json
+{
+  "success": true,
+  "result_type": "cached_reference",
+  "cache_id": "uuid-string",
+  "cache_type": "memory",  // 或 "file"
+  "total_size": 30520,
+  "message": "结果过大，已缓存"
+}
+```
+
+**缓存策略**：
+- **内存缓存**: 结果 ≤ 10KB，快速访问
+- **文件缓存**: 结果 > 10KB，节省内存
+- **自动过期**: TTL = 5 分钟（可配置）
+- **LRU 淘汰**: 内存缓存最多保留 100 项
+
+**配置参数**（在服务配置中设置）：
+```json
+{
+  "mcpServers": {
+    "your_service": {
+      "max_output_bytes": 1000,        // 触发缓存的阈值
+      "cache_large_results": true,      // 是否启用缓存
+      "result_cache_ttl": 300,          // 缓存过期时间（秒）
+      "max_memory_cache_size": 10240    // 内存缓存阈值（字节）
+    }
+  }
+}
+```
+
+**使用场景**：
+1. **大文件读取** - 读取几MB的文件，先搜索定位再精确获取
+2. **日志分析** - 在大量日志中搜索错误信息
+3. **数据查询** - 返回大量数据时分段展示
 
 ---
 
