@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 from contextlib import asynccontextmanager
+import uuid
+import threading
+import time
+import json
+from collections import OrderedDict
 
 # 尝试导入版本信息
 try:
@@ -256,6 +261,12 @@ class MCPServerConfig(BaseModel):
     # 通用配置
     timeout: int = 30
     description: str = ""
+    # 缓存配置
+    max_output_bytes: int = 1000  # 触发缓存的输出字节数阈值
+    output_truncate_strategy: str = "tail"  # 截断策略: "tail", "head", "middle"
+    cache_large_results: bool = True  # 是否启用大结果缓存
+    result_cache_ttl: int = 300  # 缓存过期时间（秒）
+    max_memory_cache_size: int = 10240  # 内存缓存阈值（字节），超过此大小使用文件缓存
 
 
 class Config(BaseModel):
@@ -281,6 +292,28 @@ class ServerRestartRequest(BaseModel):
     config: Optional[Dict[str, Any]] = None  # 可选的新配置
 
 
+class GetResultRequest(BaseModel):
+    """获取缓存结果请求"""
+    cache_id: str
+    start: Optional[int] = 0
+    end: Optional[int] = None
+
+
+class SearchCacheRequest(BaseModel):
+    """搜索缓存内容请求"""
+    cache_id: str
+    keyword: str
+    case_sensitive: Optional[bool] = False
+    max_results: Optional[int] = 50
+
+
+class GetCacheContextRequest(BaseModel):
+    """获取缓存上下文请求"""
+    cache_id: str
+    line_num: int
+    context_lines: Optional[int] = 3
+
+
 class MCPManager:
     """MCP服务管理器"""
     
@@ -289,6 +322,11 @@ class MCPManager:
         self.tool_call_history: Dict[str, int] = {}
         self.sessions: Dict[str, ClientSession] = {}
         self.config_cache: Dict[str, Any] = {}  # 缓存配置用于重启单个服务
+        
+        # 缓存系统相关
+        self.memory_cache: OrderedDict = OrderedDict()  # 内存缓存
+        self.cache_lock = threading.RLock()  # 缓存访问锁
+        self.max_memory_cache_items = 100  # 最大内存缓存条目数
     
     async def load_config(self, config_path: Path) -> Dict[str, Any]:
         """加载配置文件"""
@@ -714,10 +752,43 @@ class MCPManager:
             # 调用工具
             result = await target_session.call_tool(tool_name, cleaned_args)
             
+            # 获取服务配置
+            server_config = self.clients[target_server]["config"]
+            
+            # 将MCP结果转换为可序列化的格式
+            if hasattr(result, 'model_dump'):
+                # 使用Pydantic的model_dump方法（如果可用）
+                serializable_result = result.model_dump()
+            elif hasattr(result, '__dict__'):
+                # 尝试转换对象为字典
+                import copy
+                try:
+                    serializable_result = copy.deepcopy(result.__dict__)
+                except Exception:
+                    # 如果deepcopy失败，尝试手动转换
+                    serializable_result = {}
+                    for attr_name in dir(result):
+                        if not attr_name.startswith('_'):
+                            attr_value = getattr(result, attr_name)
+                            if isinstance(attr_value, (str, int, float, bool, list, dict, type(None))):
+                                serializable_result[attr_name] = attr_value
+                            else:
+                                # 尝试转换为字符串表示
+                                try:
+                                    serializable_result[attr_name] = str(attr_value)
+                                except:
+                                    serializable_result[attr_name] = f"<unserializable: {type(attr_value).__name__}>"
+            else:
+                # 如果无法转换，直接使用结果
+                serializable_result = result
+            
+            # 使用缓存系统处理结果
+            cached_result = self.cache_result(serializable_result, server_config)
+            
             # 重置调用计数
             self.tool_call_history[call_key] = 0
             
-            return result
+            return cached_result
         
         except Exception as e:
             # 增加调用计数
@@ -791,6 +862,393 @@ class MCPManager:
             # 无论如何都从字典中移除
             self.clients.pop(server_name, None)
     
+    def _get_cache_directory(self) -> Path:
+        """获取缓存目录路径"""
+        # 根据操作系统确定缓存目录
+        if sys.platform == "win32":
+            cache_dir = Path(os.environ.get("APPDATA", "")) / "mcp-bridge" / "cache"
+        elif sys.platform == "darwin":
+            cache_dir = Path.home() / "Library" / "Application Support" / "mcp-bridge" / "cache"
+        else:  # Linux and others
+            cache_dir = Path.home() / ".cache" / "mcp-bridge"
+        
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+    
+    def _store_in_file_cache(self, content: Any, ttl: int) -> str:
+        """将内容存储到文件缓存并返回ID"""
+        cache_id = str(uuid.uuid4())
+        cache_file = self._get_cache_directory() / f"{cache_id}.txt"
+        
+        # 序列化内容
+        if isinstance(content, str):
+            content_str = content
+        else:
+            content_str = json.dumps(content, ensure_ascii=False, indent=2)
+        
+        # 写入文件
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            f.write(content_str)
+        
+        # 创建元数据文件
+        metadata_file = self._get_cache_directory() / f"{cache_id}.meta"
+        metadata = {
+            "created_at": time.time(),
+            "expires_at": time.time() + ttl,
+            "size": len(content_str.encode('utf-8'))
+        }
+        
+        with open(metadata_file, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f)
+        
+        return cache_id
+    
+    def _get_from_file_cache(self, cache_id: str) -> Optional[Any]:
+        """从文件缓存获取内容"""
+        cache_file = self._get_cache_directory() / f"{cache_id}.txt"
+        metadata_file = self._get_cache_directory() / f"{cache_id}.meta"
+        
+        # 检查文件是否存在
+        if not cache_file.exists() or not metadata_file.exists():
+            return None
+        
+        # 检查过期时间
+        try:
+            with open(metadata_file, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+            
+            if time.time() > metadata.get("expires_at", 0):
+                # 过期，删除文件
+                cache_file.unlink(missing_ok=True)
+                metadata_file.unlink(missing_ok=True)
+                return None
+        except:
+            return None
+        
+        # 读取内容
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # 尝试解析JSON，如果不是JSON则返回原字符串
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                return content
+        except:
+            return None
+    
+    def _store_in_memory_cache(self, content: Any, ttl: int) -> str:
+        """将内容存储到内存缓存并返回ID"""
+        cache_id = str(uuid.uuid4())
+        
+        with self.cache_lock:
+            # 清理过期项
+            current_time = time.time()
+            expired_keys = []
+            for key, (_, expire_time) in list(self.memory_cache.items()):
+                if current_time > expire_time:
+                    expired_keys.append(key)
+            for key in expired_keys:
+                self.memory_cache.pop(key, None)
+            
+            # 如果达到最大容量，移除最旧的项
+            while len(self.memory_cache) >= self.max_memory_cache_items:
+                oldest_key = next(iter(self.memory_cache))
+                self.memory_cache.pop(oldest_key, None)
+            
+            # 存储新项
+            self.memory_cache[cache_id] = (content, current_time + ttl)
+        
+        return cache_id
+    
+    def _get_from_memory_cache(self, cache_id: str) -> Optional[Any]:
+        """从内存缓存获取内容"""
+        with self.cache_lock:
+            if cache_id not in self.memory_cache:
+                return None
+            
+            content, expire_time = self.memory_cache[cache_id]
+            current_time = time.time()
+            
+            if current_time > expire_time:
+                # 过期，删除项
+                self.memory_cache.pop(cache_id, None)
+                return None
+            
+            # 移动到末尾（LRU策略）
+            self.memory_cache.pop(cache_id)
+            self.memory_cache[cache_id] = (content, expire_time)
+            
+            return content
+    
+    def cache_result(self, content: Any, server_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """根据内容大小和配置决定缓存策略"""
+        # 获取配置参数
+        if server_config is None:
+            server_config = {}
+        
+        # 兼容旧配置名称 max_output_length，优先使用新名称 max_output_bytes
+        max_output_bytes = server_config.get("max_output_bytes", server_config.get("max_output_length", 1000))
+        cache_large_results = server_config.get("cache_large_results", True)
+        result_cache_ttl = server_config.get("result_cache_ttl", 300)
+        max_memory_cache_size = server_config.get("max_memory_cache_size", 10240)  # 10KB
+        
+        # 序列化内容以计算大小（字节数）
+        if isinstance(content, str):
+            content_str = content
+        else:
+            content_str = json.dumps(content, ensure_ascii=False)
+        
+        content_size = len(content_str.encode('utf-8'))
+        
+        if cache_large_results and content_size > max_output_bytes:
+            # 内容超过阈值，需要缓存
+            if content_size <= max_memory_cache_size:
+                # 使用内存缓存
+                cache_id = self._store_in_memory_cache(content, result_cache_ttl)
+                cache_type = "memory"
+            else:
+                # 使用文件缓存
+                cache_id = self._store_in_file_cache(content, result_cache_ttl)
+                cache_type = "file"
+            
+            return {
+                "result_type": "cached_reference",
+                "cache_id": cache_id,
+                "cache_type": cache_type,
+                "total_size": content_size,
+                "message": f"结果过大({content_size}字节)，已存储在{'内存' if cache_type == 'memory' else '文件'}缓存中，使用 /result/{cache_id} 获取完整结果"
+            }
+        else:
+            # 内容较小，直接返回
+            return {
+                "result_type": "direct",
+                "result": content
+            }
+    
+    def get_cached_result(self, cache_id: str) -> Optional[Any]:
+        """获取缓存结果"""
+        # 首先尝试从内存缓存获取
+        result = self._get_from_memory_cache(cache_id)
+        if result is not None:
+            return result
+        
+        # 如果内存中没有，尝试从文件缓存获取
+        return self._get_from_file_cache(cache_id)
+    
+    def get_cached_result_partial(self, cache_id: str, start: int = 0, end: Optional[int] = None) -> Dict[str, Any]:
+        """获取缓存结果的部分内容"""
+        content = self.get_cached_result(cache_id)
+        if content is None:
+            return {"error": "缓存ID不存在或已过期"}
+        
+        if isinstance(content, str):
+            # 字符串内容的分段
+            total_len = len(content)
+            actual_end = min(end, total_len) if end is not None else total_len
+            actual_start = max(0, start)
+            
+            return {
+                "content": content[actual_start:actual_end],
+                "total_length": total_len,
+                "start": actual_start,
+                "end": actual_end,
+                "has_more": actual_end < total_len
+            }
+        elif isinstance(content, list):
+            # 列表内容的分段
+            total_len = len(content)
+            actual_end = min(end, total_len) if end is not None else total_len
+            actual_start = max(0, start)
+            
+            return {
+                "content": content[actual_start:actual_end],
+                "total_length": total_len,
+                "start": actual_start,
+                "end": actual_end,
+                "has_more": actual_end < total_len
+            }
+        else:
+            # 其他类型（如dict、对象）：序列化为JSON字符串后分段
+            content_str = json.dumps(content, ensure_ascii=False, indent=2)
+            total_len = len(content_str)
+            actual_end = min(end, total_len) if end is not None else total_len
+            actual_start = max(0, start)
+            
+            return {
+                "content": content_str[actual_start:actual_end],
+                "total_length": total_len,
+                "start": actual_start,
+                "end": actual_end,
+                "has_more": actual_end < total_len
+            }
+    
+    def search_in_cache(self, cache_id: str, keyword: str, 
+                       case_sensitive: bool = False,
+                       max_results: int = 50) -> Dict[str, Any]:
+        """
+        在缓存内容中搜索关键词（流式处理，性能优化）
+        
+        Args:
+            cache_id: 缓存ID
+            keyword: 搜索关键词
+            case_sensitive: 是否区分大小写
+            max_results: 最大返回结果数
+        
+        Returns:
+            搜索结果，包含匹配的行号、列号和内容片段
+        """
+        # 首先尝试从内存缓存获取
+        content = self._get_from_memory_cache(cache_id)
+        
+        if content is not None:
+            # 内存缓存：直接搜索
+            return self._search_in_memory(content, keyword, case_sensitive, max_results)
+        
+        # 尝试从文件缓存获取
+        cache_file = self._get_cache_directory() / f"{cache_id}.txt"
+        if cache_file.exists():
+            # 文件缓存：流式读取搜索
+            return self._search_in_file_streaming(cache_file, keyword, case_sensitive, max_results)
+        
+        raise ValueError("缓存不存在或已过期")
+    
+    def _search_in_memory(self, content: Any, keyword: str, 
+                         case_sensitive: bool, max_results: int) -> Dict[str, Any]:
+        """在内存中的内容进行搜索"""
+        # 转换为字符串
+        if isinstance(content, str):
+            text = content
+        else:
+            text = json.dumps(content, ensure_ascii=False, indent=2)
+        
+        return self._search_in_text(text, keyword, case_sensitive, max_results)
+    
+    def _search_in_file_streaming(self, cache_file: Path, keyword: str,
+                                  case_sensitive: bool, max_results: int) -> Dict[str, Any]:
+        """流式读取文件并搜索（内存占用恒定）"""
+        matches = []
+        search_keyword = keyword if case_sensitive else keyword.lower()
+        line_num = 0
+        
+        try:
+            # 使用缓冲读取，每次读取 8KB
+            with open(cache_file, 'r', encoding='utf-8', buffering=8192) as f:
+                for line in f:
+                    line_num += 1
+                    search_line = line if case_sensitive else line.lower()
+                    
+                    # 查找所有匹配位置
+                    pos = 0
+                    while True:
+                        idx = search_line.find(search_keyword, pos)
+                        if idx == -1:
+                            break
+                        
+                        matches.append({
+                            "line": line_num,
+                            "column": idx,
+                            "content": line.strip()[:200]  # 限制长度避免过长
+                        })
+                        
+                        if len(matches) >= max_results:
+                            break
+                        
+                        pos = idx + 1
+                    
+                    if len(matches) >= max_results:
+                        break
+        except Exception as e:
+            print(f"流式搜索文件失败: {e}")
+            raise
+        
+        return {
+            "keyword": keyword,
+            "total_matches": len(matches),
+            "matches": matches,
+            "truncated": len(matches) >= max_results
+        }
+    
+    def _search_in_text(self, text: str, keyword: str,
+                       case_sensitive: bool, max_results: int) -> Dict[str, Any]:
+        """在文本中搜索关键词"""
+        matches = []
+        search_keyword = keyword if case_sensitive else keyword.lower()
+        lines = text.split('\n')
+        
+        for line_num, line in enumerate(lines, 1):
+            search_line = line if case_sensitive else line.lower()
+            
+            # 查找所有匹配位置
+            pos = 0
+            while True:
+                idx = search_line.find(search_keyword, pos)
+                if idx == -1:
+                    break
+                
+                matches.append({
+                    "line": line_num,
+                    "column": idx,
+                    "content": line.strip()[:200]  # 限制长度
+                })
+                
+                if len(matches) >= max_results:
+                    break
+                
+                pos = idx + 1
+            
+            if len(matches) >= max_results:
+                break
+        
+        return {
+            "keyword": keyword,
+            "total_matches": len(matches),
+            "matches": matches,
+            "truncated": len(matches) >= max_results
+        }
+    
+    def get_context_around_line(self, cache_id: str, line_num: int,
+                                context_lines: int = 3) -> Dict[str, Any]:
+        """
+        获取指定行及其上下文
+        
+        Args:
+            cache_id: 缓存ID
+            line_num: 目标行号（从1开始）
+            context_lines: 上下文行数
+        
+        Returns:
+            包含目标行及上下文的内容
+        """
+        content = self.get_cached_result(cache_id)
+        if content is None:
+            raise ValueError("缓存不存在或已过期")
+        
+        # 转换为字符串
+        if isinstance(content, str):
+            text = content
+        else:
+            text = json.dumps(content, ensure_ascii=False, indent=2)
+        
+        lines = text.split('\n')
+        total_lines = len(lines)
+        
+        # 计算上下文范围
+        start_line = max(1, line_num - context_lines)
+        end_line = min(total_lines, line_num + context_lines)
+        
+        # 提取上下文内容
+        context_content = '\n'.join(lines[start_line-1:end_line])
+        
+        return {
+            "target_line": line_num,
+            "context_start": start_line,
+            "context_end": end_line,
+            "total_lines": total_lines,
+            "content": context_content
+        }
+    
     async def restart_server(self, server_name: str, server_config: Optional[Dict[str, Any]] = None):
         """重启指定的服务器"""
         # 如果没有提供配置，使用缓存的配置
@@ -851,6 +1309,10 @@ async def lifespan(app: FastAPI):
         print(f"   GET  /tools?serverName=<name>    - 获取指定服务下的[工具]列表")
         print(f"   GET  /tool-detail?toolName=<n>   - 获取工具的详细参数定义")
         print(f"   POST /execute                    - 执行工具（可选 serverName 参数）")
+        print(f"   POST /result                     - 获取缓存结果（分段）")
+        print(f"   GET  /result/{'{cache_id}'}            - 获取缓存结果（分段，简单接口）")
+        print(f"   POST /search-cache               - 在缓存中搜索关键词")
+        print(f"   POST /get-cache-context          - 获取缓存指定行的上下文")
         print(f"   GET  /config                     - 读取配置文件内容")
         print(f"   POST /config                     - 更新配置文件并重载")
         print(f"   POST /reload                     - 手动重载所有服务")
@@ -959,12 +1421,21 @@ async def execute_tool(request: ExecuteRequest):
             request.serverName  # 传递可选的服务名称
         )
         
-        # 提取内容
-        content = []
-        if hasattr(result, 'content'):
-            content = result.content
-        
-        return {"success": True, "result": content}
+        # 检查结果类型
+        if isinstance(result, dict) and result.get("result_type") == "cached_reference":
+            # 返回缓存引用
+            return {
+                "success": True,
+                "result_type": result["result_type"],
+                "cache_id": result["cache_id"],
+                "cache_type": result["cache_type"],
+                "total_size": result["total_size"],
+                "message": result["message"]
+            }
+        else:
+            # 返回直接结果
+            content = result.get("result") if isinstance(result, dict) and "result" in result else result
+            return {"success": True, "result": content}
     
     except Exception as e:
         import traceback
@@ -1074,6 +1545,108 @@ async def shutdown_server(request: ServerRestartRequest):
             "message": f"服务 {server_name} 已关闭"
         }
     
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/result")
+async def get_cached_result(request: GetResultRequest):
+    """获取缓存的结果"""
+    try:
+        result = manager.get_cached_result_partial(request.cache_id, request.start, request.end)
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+        
+        return {
+            "success": True,
+            "result": result["content"],
+            "metadata": {
+                "total_length": result["total_length"],
+                "start": result["start"],
+                "end": result["end"],
+                "has_more": result["has_more"]
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/result/{cache_id}")
+async def get_cached_result_simple(cache_id: str, start: int = 0, end: Optional[int] = None):
+    """获取缓存结果的简单接口"""
+    try:
+        result = manager.get_cached_result_partial(cache_id, start, end)
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+        
+        return {
+            "success": True,
+            "result": result["content"],
+            "metadata": {
+                "total_length": result["total_length"],
+                "start": result["start"],
+                "end": result["end"],
+                "has_more": result["has_more"]
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/search-cache")
+async def search_cache(request: SearchCacheRequest):
+    """
+    在缓存内容中搜索关键词
+    
+    请求体:
+        - cache_id: 缓存ID
+        - keyword: 搜索关键词
+        - case_sensitive: 是否区分大小写（可选，默认false）
+        - max_results: 最大返回结果数（可选，默认50）
+    
+    返回:
+        搜索结果，包含匹配的行号、列号和内容片段
+    """
+    try:
+        result = manager.search_in_cache(
+            request.cache_id,
+            request.keyword,
+            request.case_sensitive,
+            request.max_results
+        )
+        return {"success": True, "result": result}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/get-cache-context")
+async def get_cache_context(request: GetCacheContextRequest):
+    """
+    获取缓存中指定行的上下文
+    
+    请求体:
+        - cache_id: 缓存ID
+        - line_num: 目标行号（从1开始）
+        - context_lines: 上下文行数（可选，默认3）
+    
+    返回:
+        目标行及其上下文内容
+    """
+    try:
+        result = manager.get_context_around_line(
+            request.cache_id,
+            request.line_num,
+            request.context_lines
+        )
+        return {"success": True, "result": result}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         import traceback
         traceback.print_exc()
